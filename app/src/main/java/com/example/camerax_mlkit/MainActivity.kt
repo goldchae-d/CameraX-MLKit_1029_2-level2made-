@@ -28,6 +28,7 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import com.google.android.gms.tasks.CancellationTokenSource
+import com.google.android.gms.location.LocationRequest
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
@@ -107,8 +108,12 @@ class MainActivity : AppCompatActivity() {
             Log.d(TAG, "인앱 스캐너 모드로 실행됨")
         }
 
-        // TriggerGate 브로드캐스트 리시버 등록
-        registerReceiver(triggerGateReceiver, IntentFilter(TriggerGate.ACTION_PAY_PROMPT), RECEIVER_EXPORTED)
+        ContextCompat.registerReceiver(
+            this, // Context
+            triggerGateReceiver, // BroadcastReceiver
+            IntentFilter(TriggerGate.ACTION_PAY_PROMPT), // IntentFilter
+            ContextCompat.RECEIVER_EXPORTED // Flags (필요에 따라 RECEIVER_NOT_EXPORTED 사용)
+        )
 
     }
 
@@ -221,8 +226,13 @@ class MainActivity : AppCompatActivity() {
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
-                cameraProvider.unbindAll()
-                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+                // 기존 바인딩 해제
+                cameraProvider.unbindAll() // 👈 cameraProvider 인스턴스에서 호출
+
+                // 유스케이스와 라이프사이클 바인딩
+                cameraProvider.bindToLifecycle( // 👈 cameraProvider 인스턴스에서 호출
+                    this, cameraSelector, preview, imageAnalyzer)
+
             } catch (exc: Exception) {
                 Log.e(TAG, "카메라 바인딩 실패", exc)
             }
@@ -232,7 +242,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun processQrCode(qrValue: String) {
         scanResultTextView.text = "스캔 결과: $qrValue"
-        Log.d(TAG, "QR Code detected: $qrValue")
+        Log.d(
+            TAG,
+            "... geo=${TriggerGate.isInGeofence()}, beacon=${TriggerGate.isNearBeacon()}, wifi=${TriggerGate.isOnTrustedWifi()} ..."
+        )
 
         // 인앱 스캐너 모드 처리
         if (isQrOnlyMode) {
@@ -274,9 +287,9 @@ class MainActivity : AppCompatActivity() {
                 putExtra(PaymentPromptActivity.EXTRA_MESSAGE, message)
                 putExtra(PaymentPromptActivity.EXTRA_TRIGGER, "QR_SCAN") // 트리거 이유 명시
                 // TriggerGate의 현재 상태를 전달 (비공개 멤버 대신 getter 사용)
-                putExtra("geo", TriggerGate.inGeofence) // TriggerGate에 public getter가 필요할 수 있음
-                putExtra("beacon", TriggerGate.nearBeacon) // TriggerGate에 public getter가 필요할 수 있음
-                putExtra("wifi", TriggerGate.onTrustedWifi) // TriggerGate에 public getter가 필요할 수 있음
+                putExtra("geo", TriggerGate.isInGeofence())
+                putExtra("beacon", TriggerGate.isNearBeacon())
+                putExtra("wifi", TriggerGate.isOnTrustedWifi())
                 // fenceId는 getLastFenceId()를 통해 가져옵니다.
                 putExtra("fenceId", TriggerGate.getLastFenceId() ?: "unknown")
             }
@@ -312,8 +325,8 @@ class MainActivity : AppCompatActivity() {
                 Log.d(TAG, "Checking last location for Geofence state recovery: Lat=$currentLat, Lng=$currentLng")
 
                 // 🚨 수정: GeofenceRegistrar 클래스 인스턴스(geofenceRegistrar)를 통해 isInside 호출
-                val isInA = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_A_ID)
-                val isInB = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_B_ID)
+                val isInA = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_A_ID) // 👈 geofenceRegistrar 인스턴스 사용
+                val isInB = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_B_ID) // 👈 geofenceRegistrar 인스턴스 사용
 
                 val inZone = isInA || isInB // 둘 중 하나라도 안에 있으면 true
                 val fenceId = when {

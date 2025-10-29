@@ -43,6 +43,9 @@ object TriggerGate {
     @Volatile private var nearBeacon: Boolean = false
     @Volatile private var lastFenceId: String? = null // 가장 최근 진입/체류/이탈을 발생시킨 지오펜스 ID
 
+    fun isInGeofence(): Boolean = inGeofence
+    fun isNearBeacon(): Boolean = nearBeacon
+    fun isOnTrustedWifi(): Boolean = onTrustedWifi
     data class BeaconMeta(
         val uuid: String,
         val major: Int,
