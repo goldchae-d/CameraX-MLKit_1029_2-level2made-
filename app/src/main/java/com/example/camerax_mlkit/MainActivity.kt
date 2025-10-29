@@ -9,6 +9,9 @@ import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.location.Location
 import android.net.Uri
+import android.os.Build // Build.VERSION 확인용
+import com.example.camerax_mlkit.geofence.GeofenceRegistrar // GeofenceRegistrar 클래스
+import com.google.android.gms.location.* // Location 관련 클래스
 import android.os.Bundle
 import android.os.Looper
 import android.util.Log
@@ -24,8 +27,6 @@ import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
-import com.example.camerax_mlkit.geofence.GeofenceRegistrar
-import com.google.android.gms.location.*
 import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
@@ -184,7 +185,7 @@ class MainActivity : AppCompatActivity() {
     // 🔥 Geofence 등록 함수 추가
     @SuppressLint("MissingPermission") // 권한 체크는 이미 수행됨
     private fun setupGeofence() {
-        // GeofenceRegistrar를 사용하여 기본 지오펜스 등록
+        // GeofenceRegistrar 인스턴스를 사용하여 기본 지오펜스 등록
         geofenceRegistrar.registerDefaultFences()
         Log.d(TAG, "Default geofences registration requested.")
     }
@@ -248,29 +249,38 @@ class MainActivity : AppCompatActivity() {
         }
 
         // 일반 모드: TriggerGate 정책 확인 후 결제 팝업 표시
+        // TriggerGate의 비공개 멤버 대신 공개된 allowedForQr() 함수 사용
         if (TriggerGate.allowedForQr()) {
             Log.d(TAG, "TriggerGate 정책 통과. 결제 팝업 표시 시도.")
             showPaymentPrompt("QR 스캔됨", qrValue)
         } else {
-            Log.d(TAG, "TriggerGate 정책 실패. 팝업 표시 안 함. (State: geo=${TriggerGate.inGeofence}, beacon=${TriggerGate.nearBeacon}, wifi=${TriggerGate.onTrustedWifi}, fenceId=${TriggerGate.lastFenceId}, beaconLoc=${TriggerGate.getCurrentBeacon()?.locationId})")
+            // 로그 출력 시에도 비공개 멤버 대신 공개된 getter 함수 사용
+            Log.d(
+                TAG,
+                "TriggerGate 정책 실패. 팝업 표시 안 함. (State: geo=${TriggerGate.inGeofence}, beacon=${TriggerGate.nearBeacon}, wifi=${TriggerGate.onTrustedWifi}, fenceId=${TriggerGate.getLastFenceId()}, beaconLoc=${TriggerGate.getCurrentBeacon()?.locationId})"
+            )
             Toast.makeText(this, "결제 허용 조건 미충족", Toast.LENGTH_SHORT).show()
         }
     }
 
     private fun showPaymentPrompt(title: String, message: String) {
-        // 이미 떠있는 팝업이 있는지 확인 (중복 방지)
-        if (supportFragmentManager.findFragmentByTag("PaymentPromptDialog") != null) {
-            Log.d(TAG, "PaymentPromptDialog is already shown.")
-            return
-        }
-        PaymentPromptActivity.showAsDialog(this, title, message, "QR_SCAN")
-    }
+        // ... (중복 팝업 방지 로직)
 
-    // --- 위치 업데이트 관련 ---
-    private fun createLocationRequest() {
-        locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000) // 10초 간격
-            .setMinUpdateIntervalMillis(5000) // 최소 5초 간격
-            .build()
+        // 🔥 [수정 7/7] PaymentPromptActivity.showAsDialog 대신 Intent로 직접 호출합니다.
+        // PaymentPromptActivity가 Dialog 테마를 사용하므로 유사하게 보입니다.
+        startActivity(
+            Intent(this, PaymentPromptActivity::class.java).apply {
+                putExtra(PaymentPromptActivity.EXTRA_TITLE,   title)
+                putExtra(PaymentPromptActivity.EXTRA_MESSAGE, message)
+                putExtra(PaymentPromptActivity.EXTRA_TRIGGER, "QR_SCAN") // 트리거 이유 명시
+                // TriggerGate의 현재 상태를 전달 (비공개 멤버 대신 getter 사용)
+                putExtra("geo", TriggerGate.inGeofence) // TriggerGate에 public getter가 필요할 수 있음
+                putExtra("beacon", TriggerGate.nearBeacon) // TriggerGate에 public getter가 필요할 수 있음
+                putExtra("wifi", TriggerGate.onTrustedWifi) // TriggerGate에 public getter가 필요할 수 있음
+                // fenceId는 getLastFenceId()를 통해 가져옵니다.
+                putExtra("fenceId", TriggerGate.getLastFenceId() ?: "unknown")
+            }
+        )
     }
 
     private fun createLocationCallback() {
@@ -313,7 +323,7 @@ class MainActivity : AppCompatActivity() {
                 }
 
                 // 현재 TriggerGate의 상태가 실제 위치와 다를 경우에만 업데이트 (불필요한 호출 방지)
-                if (TriggerGate.inGeofence != inZone || TriggerGate.lastFenceId != fenceId) {
+                if (TriggerGate.inGeofence != inZone || TriggerGate.getLastFenceId() != fenceId) {
                     TriggerGate.onGeofenceChanged(this, inZone, fenceId)
                     Log.d(TAG, "Geofence State Restored based on last location: inside=$inZone, fence=$fenceId")
                 } else {

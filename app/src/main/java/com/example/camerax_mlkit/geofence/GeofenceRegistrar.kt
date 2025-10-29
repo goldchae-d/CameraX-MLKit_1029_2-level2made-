@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.annotation.RequiresPermission
+// 🔥 [오류 수정 1/4] GeofenceBroadcastReceiver 클래스를 임포트해야 합니다.
+import com.example.camerax_mlkit.geofence.GeofenceBroadcastReceiver
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingClient
 import com.google.android.gms.location.GeofencingRequest
@@ -32,7 +34,7 @@ class GeofenceRegistrar(private val context: Context) {
 
         private const val RADIUS_M = 200f
 
-        // 🚨 [수정 완료] isInside 함수를 여기에 위치시켜 정적 함수로 만듭니다.
+        // 🔥 [수정 2/4] isInside 함수는 companion object 안에 위치해야 합니다. (정상 위치)
         /**
          * 등록된 지오펜스 내부에 해당 좌표가 존재하는지 대략적으로 판단하는 보조 함수.
          */
@@ -58,7 +60,41 @@ class GeofenceRegistrar(private val context: Context) {
     private val geofencingClient: GeofencingClient =
         LocationServices.getGeofencingClient(context.applicationContext)
 
-    // ... (pendingIntent, buildGeofence, buildRequest 함수는 변경 없음) ...
+    // 🔥 [수정 3/4] 아래 함수들이 클래스 바로 아래에 정의되도록 들여쓰기를 수정합니다.
+    private fun pendingIntent(): PendingIntent {
+        val intent = Intent(context, GeofenceBroadcastReceiver::class.java)
+            .setAction("com.example.camerax_mlkit.GEOFENCE_EVENT") // ✅ Manifest/Receiver 와 동일
+        return PendingIntent.getBroadcast(
+            context,
+            0,
+            intent,
+            // 🔥 [오류 수정 4/4] PendingIdenT -> PendingIntent 오타 수정
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+    }
+
+    private fun buildGeofence(id: String, lat: Double, lng: Double, radius: Float): Geofence =
+        Geofence.Builder()
+            .setRequestId(id) // ✅ whitelist.locationId 와 동일해야 TriggerGate 매칭 통과
+            .setCircularRegion(lat, lng, radius)
+            .setExpirationDuration(Geofence.NEVER_EXPIRE)
+            .setTransitionTypes(
+                Geofence.GEOFENCE_TRANSITION_ENTER or
+                        Geofence.GEOFENCE_TRANSITION_EXIT or
+                        Geofence.GEOFENCE_TRANSITION_DWELL
+            )
+            .setLoiteringDelay(10_000) // DWELL 판정 지연(10s, 필요시 조정)
+            .build()
+
+    private fun buildRequest(geofences: List<Geofence>): GeofencingRequest =
+        GeofencingRequest.Builder()
+            .setInitialTrigger(
+                GeofencingRequest.INITIAL_TRIGGER_ENTER or
+                        GeofencingRequest.INITIAL_TRIGGER_DWELL
+            )
+            .addGeofences(geofences)
+            .build()
+    // 🔥 [수정 3/4] 여기까지 함수들이 클래스 멤버인지 확인 (unregisterAll 안에 있으면 안 됩니다)
 
     /**
      * 권한 전제:
@@ -89,6 +125,6 @@ class GeofenceRegistrar(private val context: Context) {
             .addOnSuccessListener { Log.i(TAG, "Geofences unregistered") }
             .addOnFailureListener { e -> Log.e(TAG, "Unregister failed", e) }
 
-        // ❌ [삭제] unregisterAll 함수 내부에 있던 isInside 함수 정의를 삭제합니다.
+        // isInside 함수는 companion object로 이동했으므로 여기서는 삭제해야 합니다.
     }
 }
