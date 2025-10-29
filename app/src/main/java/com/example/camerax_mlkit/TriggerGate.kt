@@ -33,6 +33,10 @@ object TriggerGate {
     /** 앱 내 브로드캐스트: 포그라운드일 때 PaymentPromptActivity 없이도 화면(프래그먼트 등)에게 알릴 수 있다. */
     const val ACTION_PAY_PROMPT = "com.example.camerax_mlkit.ACTION_PAY_PROMPT"
 
+    // --- 알림 채널 --- (오류 발생 방지를 위해 상위로 이동)
+    private const val CH_PAY_PROMPT = "pay_prompt"
+    private const val NOTI_ID = 2025
+
     // --- 러닝 상태 (멀티스레드 접근 가능 값들은 volatile/atomic 사용) ---
     @Volatile private var onTrustedWifi: Boolean = false
     @Volatile private var inGeofence: Boolean = false
@@ -56,12 +60,14 @@ object TriggerGate {
     private const val BEACON_NEAR_TIMEOUT_MS = 15000L
     private var beaconNearUntil = 0L
 
-    /** 계좌 QR(일반 카메라) 경로에서 허용 여부: 신뢰 Wi-Fi 일 때만 허용하도록 유지. */
-    fun allowedForQr(): Boolean = onTrustedWifi
 
-    // --- 알림 채널 ---
-    private const val CH_PAY_PROMPT = "pay_prompt"
-    private const val NOTI_ID = 2025
+    /**
+     * 계좌 QR(일반 카메라) 경로에서 허용 여부를 판단한다.
+     * 수정: 신뢰 Wi-Fi뿐만 아니라 (지오펜스+비콘) 조건도 함께 확인하도록 변경.
+     */
+    fun allowedForQr(): Boolean {
+        return evaluatePolicy().first // 정책 평가 함수의 결과(allow 여부)를 바로 반환
+    }
 
     //region 지오펜스 상태 갱신 ------------------------------------------------------
 
@@ -177,6 +183,21 @@ object TriggerGate {
     fun getLastFenceId(): String? = lastFenceId
 
     //region 정책 평가 및 노출 -------------------------------------------------------
+    /**
+     * 현재 컨텍스트(지오펜스+비콘 또는 신뢰Wi-Fi)가 결제를 허용하는 상태인지 확인한다.
+     * 정책: (지오펜스 AND 비콘 AND locationId 일치) OR 신뢰 Wi-Fi
+     * @return Triple(허용 여부, 현재 비콘 위치, 현재 펜스 위치)
+     */
+    fun evaluatePolicy(): Triple<Boolean, String?, String?> {
+        val beaconLoc = currentBeaconRef.get()?.locationId?.lowercase()
+        val fenceLoc = lastFenceId?.lowercase()
+        val locMatch = beaconLoc != null && fenceLoc != null && beaconLoc == fenceLoc
+
+        // ✅ 핵심 정책 로직: 이 로직을 maybeShow()와 allowedForQr()이 공유하게 됩니다.
+        val allow = (inGeofence && nearBeacon && locMatch) || onTrustedWifi
+
+        return Triple(allow, beaconLoc, fenceLoc)
+    }
 
     /**
      * 현재 상태를 평가해 결제 안내를 노출한다.
@@ -187,15 +208,18 @@ object TriggerGate {
         val now = SystemClock.elapsedRealtime()
         if (now - lastShownAt <= COOLDOWN_MS) return
 
-        val beaconLoc = currentBeaconRef.get()?.locationId?.lowercase()
-        val fenceLoc = lastFenceId?.lowercase()
-        val locMatch = beaconLoc != null && fenceLoc != null && beaconLoc == fenceLoc
+        // ❌ [오류 해결] 여기에서 evaluatePolicy()를 호출하여 allow 변수를 설정합니다.
+        val (allow, beaconLoc, fenceLoc) = evaluatePolicy()
+        val locMatch = (beaconLoc != null && fenceLoc != null && beaconLoc == fenceLoc) // 디버그 로그 출력용
 
+        // ❌ [오류 해결] 중복된 allow 선언과 정책 계산 로직을 제거합니다.
+        /*
         val allow =
             (inGeofence && nearBeacon && locMatch) ||  // 같은 장소일 때만 허용
                     onTrustedWifi                               // 또는 신뢰 Wi-Fi
+        */
 
-        if (!allow) {
+        if (!allow) { // evaluatePolicy()에서 계산된 allow 변수 사용
             Log.d(
                 TAG,
                 "Popup BLOCK → geo=$inGeofence beacon=$nearBeacon wifi=$onTrustedWifi " +
