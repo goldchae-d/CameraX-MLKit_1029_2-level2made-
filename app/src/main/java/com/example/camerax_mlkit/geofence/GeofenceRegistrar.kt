@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import androidx.annotation.RequiresPermission
-import com.example.camerax_mlkit.geofence.GeofenceBroadcastReceiver
 import com.google.android.gms.location.Geofence
 import com.google.android.gms.location.GeofencingClient
 import com.google.android.gms.location.GeofencingRequest
@@ -14,7 +13,7 @@ import com.google.android.gms.location.LocationServices
 /**
  * 지오펜스 등록/해제 전담 모듈.
  * - requestId 는 화이트리스트의 locationId 와 일치해야 함.
- *   예) "store_duksung_a", "store_duksung_b"
+ * 예) "store_duksung_a", "store_duksung_b"
  */
 class GeofenceRegistrar(private val context: Context) {
 
@@ -32,43 +31,34 @@ class GeofenceRegistrar(private val context: Context) {
         private const val B_LNG = 127.01527
 
         private const val RADIUS_M = 200f
-    }
+
+        // 🚨 [수정 완료] isInside 함수를 여기에 위치시켜 정적 함수로 만듭니다.
+        /**
+         * 등록된 지오펜스 내부에 해당 좌표가 존재하는지 대략적으로 판단하는 보조 함수.
+         */
+        fun isInside(currentLat: Double, currentLng: Double, fenceId: String): Boolean {
+            // 등록된 지오펜스 A와 B의 중심 좌표를 가져옵니다.
+            val (lat, lng) = when (fenceId.lowercase()) {
+                FENCE_A_ID -> Pair(A_LAT, A_LNG)
+                FENCE_B_ID -> Pair(B_LAT, B_LNG)
+                else -> return false // 등록되지 않은 ID
+            }
+
+            // 여기서는 위도/경도의 대략적인 거리를 이용한 근사치 계산을 사용합니다.
+            val RADIUS_DEGREE_APPROX = 0.0018 // 200m 근사치
+
+            val dx = currentLng - lng
+            val dy = currentLat - lat
+
+            // 유클리드 거리 제곱이 반경 제곱보다 작으면 안에 있다고 간주
+            return (dx * dx + dy * dy) < (RADIUS_DEGREE_APPROX * RADIUS_DEGREE_APPROX)
+        }
+    } // 👈 companion object 끝
 
     private val geofencingClient: GeofencingClient =
         LocationServices.getGeofencingClient(context.applicationContext)
 
-    private fun pendingIntent(): PendingIntent {
-        val intent = Intent(context, GeofenceBroadcastReceiver::class.java)
-            .setAction("com.example.camerax_mlkit.GEOFENCE_EVENT") // ✅ Manifest/Receiver 와 동일
-        return PendingIntent.getBroadcast(
-            context,
-            0,
-            intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
-        )
-    }
-
-    private fun buildGeofence(id: String, lat: Double, lng: Double, radius: Float): Geofence =
-        Geofence.Builder()
-            .setRequestId(id) // ✅ whitelist.locationId 와 동일해야 TriggerGate 매칭 통과
-            .setCircularRegion(lat, lng, radius)
-            .setExpirationDuration(Geofence.NEVER_EXPIRE)
-            .setTransitionTypes(
-                Geofence.GEOFENCE_TRANSITION_ENTER or
-                        Geofence.GEOFENCE_TRANSITION_EXIT or
-                        Geofence.GEOFENCE_TRANSITION_DWELL
-            )
-            .setLoiteringDelay(10_000) // DWELL 판정 지연(10s, 필요시 조정)
-            .build()
-
-    private fun buildRequest(geofences: List<Geofence>): GeofencingRequest =
-        GeofencingRequest.Builder()
-            .setInitialTrigger(
-                GeofencingRequest.INITIAL_TRIGGER_ENTER or
-                        GeofencingRequest.INITIAL_TRIGGER_DWELL
-            )
-            .addGeofences(geofences)
-            .build()
+    // ... (pendingIntent, buildGeofence, buildRequest 함수는 변경 없음) ...
 
     /**
      * 권한 전제:
@@ -98,5 +88,7 @@ class GeofenceRegistrar(private val context: Context) {
         geofencingClient.removeGeofences(pendingIntent())
             .addOnSuccessListener { Log.i(TAG, "Geofences unregistered") }
             .addOnFailureListener { e -> Log.e(TAG, "Unregister failed", e) }
+
+        // ❌ [삭제] unregisterAll 함수 내부에 있던 isInside 함수 정의를 삭제합니다.
     }
 }

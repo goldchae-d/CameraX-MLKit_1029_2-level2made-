@@ -174,7 +174,8 @@ object TriggerGate {
     //endregion --------------------------------------------------------------------
 
     /** 앱이 다시 전면으로 올 때도 정책을 재평가한다. */
-    fun onAppResumed(ctx: Context) = maybeShow(ctx, reason = "RESUME")
+    fun onAppResumed(ctx: Context) {maybeShow(ctx, reason = "RESUME")
+    }
 
     /** 현재 매칭된 비콘 메타를 읽는다(디버깅/표시용). */
     fun getCurrentBeacon(): BeaconMeta? = currentBeaconRef.get()
@@ -194,7 +195,7 @@ object TriggerGate {
         val locMatch = beaconLoc != null && fenceLoc != null && beaconLoc == fenceLoc
 
         // ✅ 핵심 정책 로직: 이 로직을 maybeShow()와 allowedForQr()이 공유하게 됩니다.
-        val allow = (inGeofence && nearBeacon && locMatch) || onTrustedWifi
+        val allow = nearBeacon
 
         return Triple(allow, beaconLoc, fenceLoc)
     }

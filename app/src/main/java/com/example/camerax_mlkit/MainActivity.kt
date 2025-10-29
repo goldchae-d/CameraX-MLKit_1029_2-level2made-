@@ -1,483 +1,381 @@
 package com.example.camerax_mlkit
 
 import android.Manifest
-import android.app.PendingIntent
-import android.content.*
+import android.annotation.SuppressLint
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.location.Location
 import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.MediaStore
-import android.provider.Settings
+import android.os.Looper
 import android.util.Log
+import android.widget.Button
+import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.mlkit.vision.MlKitAnalyzer
-import androidx.camera.view.CameraController.COORDINATE_SYSTEM_VIEW_REFERENCED
-import androidx.camera.view.LifecycleCameraController
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.example.camerax_mlkit.databinding.ActivityMainBinding
-import com.google.android.gms.common.api.ApiException
-import com.google.android.gms.common.api.ResolvableApiException
+import com.example.camerax_mlkit.geofence.GeofenceRegistrar
 import com.google.android.gms.location.*
-import com.google.mlkit.vision.barcode.BarcodeScanner
+import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.mlkit.vision.barcode.BarcodeScannerOptions
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
-import java.text.SimpleDateFormat
-import java.util.Locale
+import com.google.mlkit.vision.common.InputImage
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
-import android.content.ContentValues
-import android.annotation.SuppressLint
 
 class MainActivity : AppCompatActivity() {
 
-    // ───────── Camera / ML Kit ─────────
-    private lateinit var viewBinding: ActivityMainBinding
-    private var cameraExecutor: ExecutorService? = null
-    private var barcodeScanner: BarcodeScanner? = null
-    private var cameraController: LifecycleCameraController? = null
-    private var scannerOnlyMode = false
+    // --- 카메라 관련 ---
+    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var previewView: PreviewView
 
-    // ───────── Geofence ─────────
-    private lateinit var geofencingClient: GeofencingClient
-    private lateinit var settingsClient: SettingsClient
+    // --- 위치 관련 ---
+    private lateinit var fusedLocationClient: FusedLocationProviderClient
+    private lateinit var locationCallback: LocationCallback
+    private lateinit var locationRequest: LocationRequest
+    private lateinit var geofenceRegistrar: GeofenceRegistrar // 🔥 GeofenceRegistrar 추가
 
-    // 내부 브로드캐스트(TriggerGate → PaymentPromptActivity)
-    private val payPromptReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action == TriggerGate.ACTION_PAY_PROMPT) {
-                if (!TriggerGate.allowedForQr()) {
-                    Log.d(TAG, "skip pay prompt: wifi not allowed")
-                    return
+    // --- 기타 UI ---
+    private lateinit var scanResultTextView: TextView
+    private lateinit var accountQrButton: Button
+
+    // --- 상태 변수 ---
+    private var isQrOnlyMode = false // 인앱 스캐너 모드 플래그
+
+    // --- 퍼미션 요청 런처 ---
+    private val requestPermissionsLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) { permissions ->
+            handlePermissionsResult(permissions)
+        }
+
+    // --- TriggerGate 연동 ---
+    private val triggerGateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == TriggerGate.ACTION_PAY_PROMPT) {
+                // 앱이 포그라운드일 때 수신 -> 현재 QR 스캔 모드가 아니면 바로 팝업
+                if (!isQrOnlyMode) {
+                    val reason = intent.getStringExtra("reason") ?: "unknown"
+                    showPaymentPrompt("TriggerGate 알림", "Reason: $reason")
                 }
-                Log.d(TAG, "ACTION_PAY_PROMPT → PaymentPromptActivity")
-                val reason = intent.getStringExtra("reason")
-                val geo    = intent.getBooleanExtra("geo", false)
-                val beacon = intent.getBooleanExtra("beacon", false)
-                val wifi   = intent.getBooleanExtra("wifi", false)
-                startActivity(
-                    Intent(this@MainActivity, PaymentPromptActivity::class.java).apply {
-                        putExtra(PaymentPromptActivity.EXTRA_TITLE,   "결제 안내")
-                        putExtra(PaymentPromptActivity.EXTRA_MESSAGE, "안전한 QR 결제를 진행하세요.")
-                        putExtra(PaymentPromptActivity.EXTRA_TRIGGER, reason ?: "prompt")
-                        putExtra("geo", geo); putExtra("beacon", beacon); putExtra("wifi", wifi)
-                    }
-                )
             }
         }
     }
 
-    // 지오펜스 PendingIntent (항상 같은 action/reqCode/flags)
-    private fun geofencePendingIntent(): PendingIntent {
-        val intent = Intent(GEOFENCE_ACTION).setClass(
-            this,
-            com.example.camerax_mlkit.geofence.GeofenceBroadcastReceiver::class.java
-        )
-        val flags = if (Build.VERSION.SDK_INT >= 31)
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-        else
-            PendingIntent.FLAG_UPDATE_CURRENT
-        return PendingIntent.getBroadcast(this, GEOFENCE_REQ_CODE, intent, flags)
-    }
-
-    // BLE 권한 런처
-    private val blePermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestMultiplePermissions()
-    ) { result ->
-        val fine = result[Manifest.permission.ACCESS_FINE_LOCATION] ?: false
-        val scan = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            (result[Manifest.permission.BLUETOOTH_SCAN] ?: false) else true
-        val connect = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)
-            (result[Manifest.permission.BLUETOOTH_CONNECT] ?: false) else true
-        if (fine && scan && connect) {
-            BeaconForegroundService.start(this)
-        } else {
-            Toast.makeText(this, "BLE 권한 거부(비콘 감지 비활성화)", Toast.LENGTH_LONG).show()
-            startActivity(
-                Intent(
-                    Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                    Uri.fromParts("package", packageName, null)
-                )
-            )
-        }
-    }
-
-    private val notifPermLauncher =
-        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* ignore */ }
-
-    // ───────── Lifecycle ─────────
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-        // 신뢰 Wi-Fi 감시
-        WifiTrigger.start(this)
-        ensurePostNotificationsPermission()
+        previewView = findViewById(R.id.previewView)
+        scanResultTextView = findViewById(R.id.scanResultTextView)
+        accountQrButton = findViewById(R.id.accountQrButton)
 
-        viewBinding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(viewBinding.root)
+        // 🔥 GeofenceRegistrar 인스턴스화
+        geofenceRegistrar = GeofenceRegistrar(this)
 
-        // ✅ PaymentPromptActivity → openInAppScanner()에서 넘긴 플래그 읽기
-        scannerOnlyMode = intent.getBooleanExtra("openScanner", false)
+        // 위치 클라이언트 초기화
+        fusedLocationClient = LocationServices.getFusedLocationProviderClient(this)
+        createLocationRequest()
+        createLocationCallback()
 
-        viewBinding.cameraCaptureButton.setOnClickListener { takePhoto() }
-
-        if (allPermissionsGranted()) startCameraSafely()
-        else ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-
-        // Geofencing init
-        geofencingClient = LocationServices.getGeofencingClient(this)
-        settingsClient   = LocationServices.getSettingsClient(this)
-
-        // 위치 권한 후 → 지오펜스 등록
-        ensureLocationPermission {
-            ensureLocationSettings {
-                addOrUpdateDuksungGeofence()
-            }
-        }
+        // 필수 권한 확인 및 요청
+        checkAndRequestPermissions()
 
         cameraExecutor = Executors.newSingleThreadExecutor()
 
-        // 비콘 권한/시작
-        ensureBlePermissions()
-    }
-
-    override fun onNewIntent(intent: Intent?) {
-        super.onNewIntent(intent)
-        // PaymentPromptActivity가 SINGLE_TOP으로 MainActivity를 다시 띄울 때 처리
-        val newScannerOnly = intent?.getBooleanExtra("openScanner", false) ?: false
-        if (newScannerOnly && !scannerOnlyMode) {
-            scannerOnlyMode = true
-            Toast.makeText(this, "인앱 스캐너 모드로 전환되었습니다.", Toast.LENGTH_SHORT).show()
+        // 계좌 QR 버튼 리스너
+        accountQrButton.setOnClickListener {
+            startActivity(Intent(this, AccountQrActivity::class.java))
         }
-    }
 
-    override fun onStart() {
-        super.onStart()
-        val filter = IntentFilter(TriggerGate.ACTION_PAY_PROMPT)
-        ContextCompat.registerReceiver(
-            this,
-            payPromptReceiver,
-            filter,
-            ContextCompat.RECEIVER_NOT_EXPORTED
-        )
+        // 인앱 스캐너 모드 확인 (PaymentPromptActivity 에서 호출 시)
+        isQrOnlyMode = intent.getBooleanExtra(EXTRA_QR_ONLY_MODE, false)
+        if (isQrOnlyMode) {
+            scanResultTextView.text = "URL 또는 앱 링크를 스캔하세요."
+            accountQrButton.isEnabled = false // 스캐너 모드에서는 계좌 QR 버튼 비활성화
+            Log.d(TAG, "인앱 스캐너 모드로 실행됨")
+        }
+
+        // TriggerGate 브로드캐스트 리시버 등록
+        registerReceiver(triggerGateReceiver, IntentFilter(TriggerGate.ACTION_PAY_PROMPT), RECEIVER_EXPORTED)
+
     }
 
     override fun onResume() {
         super.onResume()
-        TriggerGate.onAppResumed(applicationContext)
-    }
-
-    override fun onStop() {
-        super.onStop()
-        try { unregisterReceiver(payPromptReceiver) } catch (_: IllegalArgumentException) {}
+        // 앱이 다시 활성화될 때 TriggerGate 상태 재평가 요청
+        TriggerGate.onAppResumed(this)
     }
 
     override fun onDestroy() {
         super.onDestroy()
-        try { cameraExecutor?.shutdown() } catch (_: Throwable) {}
-        barcodeScanner?.close()
-        barcodeScanner = null
-        cameraController = null
+        cameraExecutor.shutdown()
+        stopLocationUpdates()
+        unregisterReceiver(triggerGateReceiver)
     }
 
-    // ───────── Camera / QR ─────────
-    private fun startCameraSafely() {
-        if (cameraController != null && barcodeScanner != null) return
-
-        val controller = LifecycleCameraController(baseContext)
-        val previewView: PreviewView = viewBinding.viewFinder
-
-        val options = BarcodeScannerOptions.Builder()
-            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
-            .build()
-        val scanner = BarcodeScanning.getClient(options)
-
-        controller.setImageAnalysisAnalyzer(
-            ContextCompat.getMainExecutor(this),
-            MlKitAnalyzer(
-                listOf(scanner),
-                COORDINATE_SYSTEM_VIEW_REFERENCED,
-                ContextCompat.getMainExecutor(this)
-            ) { result: MlKitAnalyzer.Result? ->
-                val barcodeResults = result?.getValue(scanner)
-                if (barcodeResults.isNullOrEmpty() || barcodeResults.first() == null) {
-                    previewView.overlay?.clear()
-                    return@MlKitAnalyzer
-                }
-
-                // 신뢰 Wi-Fi가 아닐 때는 결제 플로우로 가지 않음
-                if (!scannerOnlyMode && !TriggerGate.allowedForQr()) return@MlKitAnalyzer
-
-                val raw = barcodeResults[0].rawValue ?: return@MlKitAnalyzer
-
-                if (scannerOnlyMode && isUrl(raw)) {
-                    // 인앱 스캐너 모드 + URL → 바로 브라우저
-                    try {
-                        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(raw)))
-                    } catch (_: Exception) {
-                        Toast.makeText(this, "URL 열기 실패", Toast.LENGTH_SHORT).show()
-                    }
-                    try { controller.clearImageAnalysisAnalyzer() } catch (_: Exception) {}
-                    finish()
-                    return@MlKitAnalyzer
-                }
-
-                // 기본 동작: 결제 선택창
-                startPaymentPrompt(raw)
-            }
+    // --- 권한 처리 ---
+    private fun checkAndRequestPermissions() {
+        val requiredPermissions = mutableListOf(
+            Manifest.permission.CAMERA,
+            Manifest.permission.ACCESS_FINE_LOCATION
         )
-        controller.bindToLifecycle(this)
-        previewView.controller = controller
-
-        cameraController = controller
-        barcodeScanner = scanner
-    }
-
-    private fun startPaymentPrompt(qrCode: String) {
-        startActivity(
-            Intent(this, PaymentPromptActivity::class.java)
-                .putExtra(PaymentPromptActivity.EXTRA_QR_CODE, qrCode)
-                .putExtra(PaymentPromptActivity.EXTRA_TRIGGER, "USER")
-        )
-    }
-
-    private fun isUrl(s: String): Boolean =
-        s.startsWith("http://", true) || s.startsWith("https://", true)
-
-    private fun takePhoto() {
-        val controller = cameraController ?: return
-
-        val name = SimpleDateFormat("yyyy-MM-dd-HH-mm-ss-SSS", Locale.US)
-            .format(System.currentTimeMillis())
-
-        val contentValues = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, name)
-            put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-            if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/CameraX-Image")
-            }
+        // Android 10 (Q) 이상에서는 백그라운드 위치 권한 필요
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            requiredPermissions.add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
+        }
+        // Android 13 (Tiramisu) 이상에서는 알림 권한 필요
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            requiredPermissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+        // Android 12 (S) 이상에서는 블루투스 스캔 권한 필요
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.S) {
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            requiredPermissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
 
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(
-            contentResolver,
-            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-            contentValues
-        ).build()
-
-        controller.takePicture(
-            outputOptions,
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onError(exc: ImageCaptureException) {
-                    Log.e(TAG, "사진 촬영 실패: ${exc.message}", exc)
-                    Toast.makeText(baseContext, "사진 촬영 실패", Toast.LENGTH_SHORT).show()
-                }
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    val msg = "사진 저장 성공: ${output.savedUri}"
-                    Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
-                    Log.d(TAG, msg)
-                }
-            }
-        )
-    }
-
-    // ───────── Geofence helpers ─────────
-    private fun ensureLocationSettings(onReady: () -> Unit) {
-        val req = LocationSettingsRequest.Builder()
-            .addLocationRequest(
-                LocationRequest.Builder(Priority.PRIORITY_BALANCED_POWER_ACCURACY, 10_000L)
-                    .build()
-            )
-            .build()
-
-        settingsClient.checkLocationSettings(req)
-            .addOnSuccessListener { onReady() }
-            .addOnFailureListener { e ->
-                if (e is ResolvableApiException) {
-                    try { e.startResolutionForResult(this, RC_RESOLVE_LOCATION) }
-                    catch (t: Throwable) {
-                        Log.e(TAG, "Location settings resolution 실패", t)
-                        Toast.makeText(this, "위치 설정을 켜주세요.", Toast.LENGTH_LONG).show()
-                    }
-                } else {
-                    Log.e(TAG, "Location settings check 실패", e)
-                    Toast.makeText(this, "위치 설정을 켜주세요.", Toast.LENGTH_LONG).show()
-                }
-            }
-    }
-
-    /** ✅ 덕성여대 시연: store_duksung_a + store_duksung_b 지점 등록 */
-    @SuppressLint("MissingPermission") // 아래 호출은 hasLocationPermission() 가드 뒤에 실행됨
-    private fun addOrUpdateDuksungGeofence() {
-        // 1) 권한 가드
-        if (!hasLocationPermission()) {
-            Log.w(TAG, "지오펜스 등록 스킵: 위치 권한 미승인")
-            return
-        }
-
-        // 2) 지오펜스 구성 (좌표/반경은 시연 장소로 조정하세요)
-        val geofences = listOf(
-            buildGeofence(
-                id = "store_duksung_a",
-                lat = 37.65326,  // TODO: 실제 좌표
-                lng = 127.01640,
-                radius = 120f    // TODO: 필요 시 반경 조정
-            ),
-            buildGeofence(
-                id = "store_duksung_b",
-                lat = 37.65390,  // TODO: 실제 좌표
-                lng = 127.01690,
-                radius = 120f
-            )
-        )
-
-        val request = GeofencingRequest.Builder()
-            .setInitialTrigger(
-                GeofencingRequest.INITIAL_TRIGGER_ENTER or
-                        GeofencingRequest.INITIAL_TRIGGER_DWELL
-            )
-            .addGeofences(geofences)
-            .build()
-
-        // 3) 동일 PendingIntent 기준으로 기존 등록 제거 후 재등록(안정성)
-        geofencingClient.removeGeofences(geofencePendingIntent()).addOnCompleteListener {
-            geofencingClient.addGeofences(request, geofencePendingIntent())
-                .addOnSuccessListener {
-                    Log.i(TAG, "✅ 지오펜스 등록 완료: $geofences")
-                    Toast.makeText(this, "지오펜스 등록 완료!", Toast.LENGTH_SHORT).show()
-                }
-                .addOnFailureListener { e ->
-                    val code = (e as? ApiException)?.statusCode
-                    Log.e(TAG, "❌ 지오펜스 등록 실패 code=$code", e)
-                    if (e is SecurityException) {
-                        Log.e(TAG, "권한 문제: 위치/백그라운드 위치 확인 필요")
-                    }
-                    Toast.makeText(this, "지오펜스 실패: ${code ?: e.message}", Toast.LENGTH_LONG).show()
-                }
-        }
-    }
-
-    private fun buildGeofence(id: String, lat: Double, lng: Double, radius: Float): Geofence =
-        Geofence.Builder()
-            .setRequestId(id.lowercase()) // ✅ whitelist(locationId)와 동일
-            .setCircularRegion(lat, lng, radius)
-            .setExpirationDuration(Geofence.NEVER_EXPIRE)
-            .setTransitionTypes(
-                Geofence.GEOFENCE_TRANSITION_ENTER or
-                        Geofence.GEOFENCE_TRANSITION_EXIT or
-                        Geofence.GEOFENCE_TRANSITION_DWELL
-            )
-            .setLoiteringDelay(6_000)
-            .build()
-
-    private fun hasLocationPermission(): Boolean =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED &&
-                ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-
-    // ───────── Permissions ─────────
-    private fun ensureBlePermissions() {
-        val needS = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S
-        val required = mutableListOf(Manifest.permission.ACCESS_FINE_LOCATION).apply {
-            if (needS) {
-                add(Manifest.permission.BLUETOOTH_SCAN)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-        }
-        val missing = required.any {
+        val missingPermissions = requiredPermissions.filter {
             ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
         }
-        if (missing) blePermissionLauncher.launch(required.toTypedArray())
-        else BeaconForegroundService.start(this)
-    }
 
-    private fun ensurePostNotificationsPermission() {
-        if (Build.VERSION.SDK_INT >= 33) {
-            val p = Manifest.permission.POST_NOTIFICATIONS
-            if (ContextCompat.checkSelfPermission(this, p) != PackageManager.PERMISSION_GRANTED) {
-                notifPermLauncher.launch(p)
-            }
+        if (missingPermissions.isNotEmpty()) {
+            requestPermissionsLauncher.launch(missingPermissions.toTypedArray())
+        } else {
+            // 모든 권한이 있으면 서비스 시작
+            startServicesAndCamera()
         }
     }
 
-    private fun ensureLocationPermission(onGranted: () -> Unit = {}) {
-        val fineGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        val coarseGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
-        if (!fineGranted || !coarseGranted) {
-            ActivityCompat.requestPermissions(this, LOCATION_PERMISSIONS, REQUEST_CODE_LOCATION)
+    private fun handlePermissionsResult(permissions: Map<String, Boolean>) {
+        val allGranted = permissions.all { it.value }
+        if (allGranted) {
+            Toast.makeText(this, "모든 권한이 허용되었습니다.", Toast.LENGTH_SHORT).show()
+            startServicesAndCamera()
+        } else {
+            Toast.makeText(this, "앱 기능 사용을 위해 권한이 필요합니다.", Toast.LENGTH_LONG).show()
+            // 필요한 경우 사용자에게 설정으로 이동하도록 안내
+            // finish() // 또는 앱 종료
+        }
+    }
+
+    // --- 서비스 시작 및 카메라 설정 ---
+    @SuppressLint("MissingPermission") // 권한 체크는 이미 수행됨
+    private fun startServicesAndCamera() {
+        // 비콘 스캔 서비스 시작 (백그라운드 실행을 위해 포그라운드 서비스 사용)
+        startBeaconService()
+        // 위치 업데이트 시작
+        startLocationUpdates()
+        // 🔥 Geofence 등록 호출
+        setupGeofence()
+        // 카메라 시작
+        startCamera()
+    }
+
+    // 🔥 Geofence 등록 함수 추가
+    @SuppressLint("MissingPermission") // 권한 체크는 이미 수행됨
+    private fun setupGeofence() {
+        // GeofenceRegistrar를 사용하여 기본 지오펜스 등록
+        geofenceRegistrar.registerDefaultFences()
+        Log.d(TAG, "Default geofences registration requested.")
+    }
+
+    private fun startBeaconService() {
+        val serviceIntent = Intent(this, BeaconForegroundService::class.java)
+        ContextCompat.startForegroundService(this, serviceIntent)
+        Log.d(TAG, "BeaconForegroundService started")
+    }
+
+    // --- 카메라 설정 및 QR 스캔 ---
+    private fun startCamera() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder().build().also {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+
+            val imageAnalyzer = ImageAnalysis.Builder()
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .build()
+                .also {
+                    it.setAnalyzer(cameraExecutor, QrCodeAnalyzer { qrCodeValue ->
+                        runOnUiThread {
+                            processQrCode(qrCodeValue)
+                        }
+                    })
+                }
+
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(this, cameraSelector, preview, imageAnalyzer)
+            } catch (exc: Exception) {
+                Log.e(TAG, "카메라 바인딩 실패", exc)
+            }
+
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun processQrCode(qrValue: String) {
+        scanResultTextView.text = "스캔 결과: $qrValue"
+        Log.d(TAG, "QR Code detected: $qrValue")
+
+        // 인앱 스캐너 모드 처리
+        if (isQrOnlyMode) {
+            try {
+                // URL 또는 앱 스킴을 열려고 시도
+                val intent = Intent(Intent.ACTION_VIEW, Uri.parse(qrValue))
+                startActivity(intent)
+                finish() // 스캔 후 액티비티 종료
+            } catch (e: Exception) {
+                Toast.makeText(this, "열 수 없는 QR 코드입니다: $qrValue", Toast.LENGTH_SHORT).show()
+                Log.e(TAG, "Failed to open QR code content", e)
+            }
+            return // 스캐너 모드에서는 아래 결제 로직 실행 안 함
+        }
+
+        // 일반 모드: TriggerGate 정책 확인 후 결제 팝업 표시
+        if (TriggerGate.allowedForQr()) {
+            Log.d(TAG, "TriggerGate 정책 통과. 결제 팝업 표시 시도.")
+            showPaymentPrompt("QR 스캔됨", qrValue)
+        } else {
+            Log.d(TAG, "TriggerGate 정책 실패. 팝업 표시 안 함. (State: geo=${TriggerGate.inGeofence}, beacon=${TriggerGate.nearBeacon}, wifi=${TriggerGate.onTrustedWifi}, fenceId=${TriggerGate.lastFenceId}, beaconLoc=${TriggerGate.getCurrentBeacon()?.locationId})")
+            Toast.makeText(this, "결제 허용 조건 미충족", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun showPaymentPrompt(title: String, message: String) {
+        // 이미 떠있는 팝업이 있는지 확인 (중복 방지)
+        if (supportFragmentManager.findFragmentByTag("PaymentPromptDialog") != null) {
+            Log.d(TAG, "PaymentPromptDialog is already shown.")
             return
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            val bgGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_BACKGROUND_LOCATION) == PackageManager.PERMISSION_GRANTED
-            if (!bgGranted) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    Toast.makeText(this, "백그라운드 위치 허용이 필요하면 설정에서 ‘항상 허용’을 선택하세요.", Toast.LENGTH_LONG).show()
-                    startActivity(
-                        Intent(
-                            Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
-                            Uri.fromParts("package", packageName, null)
-                        )
-                    )
-                } else {
-                    ActivityCompat.requestPermissions(
-                        this,
-                        arrayOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION),
-                        REQUEST_CODE_BACKGROUND_LOCATION
-                    )
-                    return
+        PaymentPromptActivity.showAsDialog(this, title, message, "QR_SCAN")
+    }
+
+    // --- 위치 업데이트 관련 ---
+    private fun createLocationRequest() {
+        locationRequest = LocationRequest.Builder(Priority.PRIORITY_HIGH_ACCURACY, 10000) // 10초 간격
+            .setMinUpdateIntervalMillis(5000) // 최소 5초 간격
+            .build()
+    }
+
+    private fun createLocationCallback() {
+        locationCallback = object : LocationCallback() {
+            override fun onLocationResult(locationResult: LocationResult) {
+                locationResult.lastLocation?.let { location ->
+                    Log.d(TAG, "Location Update: Lat=${location.latitude}, Lng=${location.longitude}")
+                    // 필요 시 위치 정보를 다른 곳에 전달하거나 UI 업데이트
                 }
             }
         }
-        onGranted()
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    @SuppressLint("MissingPermission") // 권한 체크는 이미 수행됨
+    private fun startLocationUpdates() {
+        Log.i(TAG, "Starting location updates")
+        fusedLocationClient.requestLocationUpdates(
+            locationRequest,
+            locationCallback,
+            Looper.getMainLooper()
+        )
+
+// 🔥 =================== [최종 수정 시작] =================== 🔥
+        // Geofence 초기 트리거 실패 시 상태를 복구하는 로직 추가
+        fusedLocationClient.lastLocation.addOnSuccessListener { location: Location? ->
+            if (location != null) {
+                val currentLat = location.latitude
+                val currentLng = location.longitude
+                Log.d(TAG, "Checking last location for Geofence state recovery: Lat=$currentLat, Lng=$currentLng")
+
+                // 🚨 수정: GeofenceRegistrar 클래스 인스턴스(geofenceRegistrar)를 통해 isInside 호출
+                val isInA = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_A_ID)
+                val isInB = geofenceRegistrar.isInside(currentLat, currentLng, GeofenceRegistrar.FENCE_B_ID)
+
+                val inZone = isInA || isInB // 둘 중 하나라도 안에 있으면 true
+                val fenceId = when {
+                    isInA -> GeofenceRegistrar.FENCE_A_ID
+                    isInB -> GeofenceRegistrar.FENCE_B_ID
+                    else -> null
+                }
+
+                // 현재 TriggerGate의 상태가 실제 위치와 다를 경우에만 업데이트 (불필요한 호출 방지)
+                if (TriggerGate.inGeofence != inZone || TriggerGate.lastFenceId != fenceId) {
+                    TriggerGate.onGeofenceChanged(this, inZone, fenceId)
+                    Log.d(TAG, "Geofence State Restored based on last location: inside=$inZone, fence=$fenceId")
+                } else {
+                    Log.d(TAG, "Geofence State is already consistent with last location.")
+                }
+
+            } else {
+                Log.w(TAG, "Last location is null, cannot restore geofence state using last location.")
+            }
+        }.addOnFailureListener { e ->
+            Log.e(TAG, "Failed to get last location for Geofence state recovery", e)
+        }
+        // 🔥 =================== [최종 수정 끝] =================== 🔥
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int, permissions: Array<String>, grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        when (requestCode) {
-            REQUEST_CODE_PERMISSIONS -> {
-                if (allPermissionsGranted()) startCameraSafely()
-                else { Toast.makeText(this, "Permissions not granted by the user.", Toast.LENGTH_SHORT).show(); finish() }
-            }
-            REQUEST_CODE_LOCATION -> {
-                val granted = grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }
-                if (granted) ensureLocationPermission { ensureLocationSettings { addOrUpdateDuksungGeofence() } }
-                else Toast.makeText(this, "위치 권한이 필요합니다(지오펜싱).", Toast.LENGTH_LONG).show()
-            }
-            REQUEST_CODE_BACKGROUND_LOCATION -> {
-                val bgGranted = grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED
-                if (!bgGranted) Toast.makeText(this, "백그라운드 위치 권한이 거부되었습니다.", Toast.LENGTH_LONG).show()
+
+
+    private fun stopLocationUpdates() {
+        Log.i(TAG, "Stopping location updates")
+        fusedLocationClient.removeLocationUpdates(locationCallback)
+    }
+
+    // --- QR 코드 분석기 클래스 ---
+    private class QrCodeAnalyzer(private val listener: (String) -> Unit) : ImageAnalysis.Analyzer {
+        companion object {
+            private const val TAG = "QrCodeAnalyzer"
+        }
+
+        private val options = BarcodeScannerOptions.Builder()
+            .setBarcodeFormats(Barcode.FORMAT_QR_CODE)
+            .build()
+        private val scanner = BarcodeScanning.getClient(options)
+
+        @SuppressLint("UnsafeOptInUsageError")
+        override fun analyze(imageProxy: ImageProxy) {
+            val mediaImage = imageProxy.image
+            if (mediaImage != null) {
+                val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
+                scanner.process(image)
+                    .addOnSuccessListener { barcodes ->
+                        for (barcode in barcodes) {
+                            barcode.rawValue?.let {
+                                listener(it)
+                                // 첫 번째 QR 코드만 처리하고 종료 (필요 시 수정)
+                                return@addOnSuccessListener
+                            }
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e(TAG, "Barcode scanning failed", e)
+                    }
+                    .addOnCompleteListener {
+                        imageProxy.close()
+                    }
+            } else {
+                imageProxy.close() // 이미지가 null이면 바로 닫기
             }
         }
     }
 
-    // ───────── Const ─────────
     companion object {
-        private const val TAG = "CameraX-MLKit"
-
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private const val REQUEST_CODE_LOCATION = 11
-        private const val REQUEST_CODE_BACKGROUND_LOCATION = 12
-        private const val RC_RESOLVE_LOCATION = 2001
-
-        private val LOCATION_PERMISSIONS = arrayOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        private val REQUIRED_PERMISSIONS = arrayOf(Manifest.permission.CAMERA)
-
-        private const val GEOFENCE_ACTION = "com.example.camerax_mlkit.GEOFENCE_EVENT"
-        private const val GEOFENCE_REQ_CODE = 1001
+        private const val TAG = "MainActivity"
+        const val EXTRA_QR_ONLY_MODE = "qr_only_mode" // 인텐트 Extra 키
     }
 }
